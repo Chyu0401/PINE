@@ -1,23 +1,23 @@
-## 环境准备
+## Environment setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 第一步：锚点选择
+## Step 1: Anchor selection
 
-运行 `main_stage1.py`。
+Run `main_stage1.py`.
 
-## 第二步：路径准备
+## Step 2: Path preparation
 
-运行 `main_stage2.py`。
+Run `main_stage2.py`.
 
-## 第三步：正负样本构建和训练
+## Step 3: Positive/negative sample construction and training
 
-通过 bash 运行：
+Run via bash:
 
 ```bash
 bash train_params.sh
 ```
 
-该脚本会调用 `contrastive_train.py` 进行训练。
+This script invokes `contrastive_train.py` for training.
