@@ -316,7 +316,8 @@ def train_epoch(model, tokenizer, dataloader, nl_text_pool, criterion, optimizer
     return total_loss / num_batches
 
 
-def evaluate_downstream_tasks(model, tokenizer, dataset_path, device, max_length=512, batch_size=8):
+def evaluate_downstream_tasks(model, tokenizer, dataset_path, device, max_length=512, batch_size=8,
+                              log_details=True):
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     is_main = (rank == 0)
@@ -342,21 +343,24 @@ def evaluate_downstream_tasks(model, tokenizer, dataset_path, device, max_length
                 logger=None, prompt=""
             )
 
-        logger.info("评估分类任务...")
+        if log_details:
+            logger.info("评估分类任务...")
         cls_results = evaluate_embeddings_with_classification(
             embeddings.cpu().numpy(),
             labels,
             test_repeat=5
         )
 
-        logger.info("评估链路预测任务...")
+        if log_details:
+            logger.info("评估链路预测任务...")
         link_results = evaluate_link_prediction_with_variance(
             embeddings, edge_index, num_nodes,
             test_ratio=0.2, n_runs=5, device=device,
             mlp_epochs=1000, logger=None
         )
 
-        logger.info("评估聚类任务...")
+        if log_details:
+            logger.info("评估聚类任务...")
         num_clusters = int(labels.max().item() + 1)
         cluster_head = KMeansClusteringHead(
             num_clusters=num_clusters,
@@ -373,18 +377,19 @@ def evaluate_downstream_tasks(model, tokenizer, dataset_path, device, max_length
             'clustering': cluster_results
         }
 
-        logger.info(f"  分类 - Acc: {cls_results['test_acc_mean']:.2f}±{cls_results['test_acc_std']:.2f}, "
-                   f"Micro-F1: {cls_results['test_micro_f1_mean']:.2f}±{cls_results['test_micro_f1_std']:.2f}, "
-                   f"Macro-F1: {cls_results['test_macro_f1_mean']:.2f}±{cls_results['test_macro_f1_std']:.2f}")
-        logger.info(f"  链路 - AUC: {link_results['test_auc']:.2f}±{link_results['test_auc_std']:.2f}, "
-                   f"AP: {link_results['test_ap']:.2f}±{link_results['test_ap_std']:.2f}")
-        logger.info(
-            f"  聚类 - "
-            f"NMI: {cluster_results['NMI_mean']:.4f}±{cluster_results['NMI_std']:.4f}, "
-            f"ARI: {cluster_results['ARI_mean']:.4f}±{cluster_results['ARI_std']:.4f}, "
-            f"F1: {cluster_results['F1_mean']:.4f}±{cluster_results['F1_std']:.4f}, "
-            f"ACC: {cluster_results['ACC_mean']:.4f}±{cluster_results['ACC_std']:.4f}"
-        )
+        if log_details:
+            logger.info(f"  分类 - Acc: {cls_results['test_acc_mean']:.2f}±{cls_results['test_acc_std']:.2f}, "
+                       f"Micro-F1: {cls_results['test_micro_f1_mean']:.2f}±{cls_results['test_micro_f1_std']:.2f}, "
+                       f"Macro-F1: {cls_results['test_macro_f1_mean']:.2f}±{cls_results['test_macro_f1_std']:.2f}")
+            logger.info(f"  链路 - AUC: {link_results['test_auc']:.2f}±{link_results['test_auc_std']:.2f}, "
+                       f"AP: {link_results['test_ap']:.2f}±{link_results['test_ap_std']:.2f}")
+            logger.info(
+                f"  聚类 - "
+                f"NMI: {cluster_results['NMI_mean']:.4f}±{cluster_results['NMI_std']:.4f}, "
+                f"ARI: {cluster_results['ARI_mean']:.4f}±{cluster_results['ARI_std']:.4f}, "
+                f"F1: {cluster_results['F1_mean']:.4f}±{cluster_results['F1_std']:.4f}, "
+                f"ACC: {cluster_results['ACC_mean']:.4f}±{cluster_results['ACC_std']:.4f}"
+            )
 
     if dist.is_initialized():
         obj = [results] if is_main else [None]
@@ -395,6 +400,25 @@ def evaluate_downstream_tasks(model, tokenizer, dataset_path, device, max_length
     model.train()
 
     return results
+
+
+def _log_eval_metrics_from_results(epoch_results):
+    """仅打印下游指标（与 evaluate_downstream_tasks 中 log_details 块一致）。"""
+    cls_results = epoch_results['classification']
+    link_results = epoch_results['link_prediction']
+    cluster_results = epoch_results['clustering']
+    logger.info(f"  分类 - Acc: {cls_results['test_acc_mean']:.2f}±{cls_results['test_acc_std']:.2f}, "
+               f"Micro-F1: {cls_results['test_micro_f1_mean']:.2f}±{cls_results['test_micro_f1_std']:.2f}, "
+               f"Macro-F1: {cls_results['test_macro_f1_mean']:.2f}±{cls_results['test_macro_f1_std']:.2f}")
+    logger.info(f"  链路 - AUC: {link_results['test_auc']:.2f}±{link_results['test_auc_std']:.2f}, "
+               f"AP: {link_results['test_ap']:.2f}±{link_results['test_ap_std']:.2f}")
+    logger.info(
+        f"  聚类 - "
+        f"NMI: {cluster_results['NMI_mean']:.4f}±{cluster_results['NMI_std']:.4f}, "
+        f"ARI: {cluster_results['ARI_mean']:.4f}±{cluster_results['ARI_std']:.4f}, "
+        f"F1: {cluster_results['F1_mean']:.4f}±{cluster_results['F1_std']:.4f}, "
+        f"ACC: {cluster_results['ACC_mean']:.4f}±{cluster_results['ACC_std']:.4f}"
+    )
 
 
 def _append_to_results_file(results_file, training_results, config_tag, is_main_process):
@@ -580,8 +604,17 @@ def main():
             'temperature': args.temperature,
             'seed': args.seed
         },
-        'eval_results': []
+        'best_eval': None
     }
+    best_cls_acc = float('-inf')
+    best_epoch = None
+
+    def _best_eval_ref_for_log():
+        if best_epoch is None:
+            return "无"
+        if best_epoch == 0:
+            return "baseline"
+        return f"epoch {best_epoch}"
 
     dataset_path = f'./datasets/{args.dataset}/{args.dataset}.pt'
     dataset_dir = f'./datasets/{args.dataset}'
@@ -611,6 +644,10 @@ def main():
     else:
         baseline_results = None
 
+    if baseline_results and 'classification' in baseline_results:
+        best_cls_acc = baseline_results['classification']['test_acc_mean']
+        best_epoch = 0
+
     if (
         is_main_process
         and baseline_results
@@ -636,11 +673,22 @@ def main():
             }
         }
         training_results['baseline'] = baseline_summary
+        training_results['best_eval'] = {
+            'epoch': 0,
+            'source': 'baseline',
+            'classification': baseline_summary['classification'],
+            'link_prediction': baseline_summary['link_prediction'],
+            'clustering': baseline_summary['clustering'],
+        }
         _append_to_results_file(args.results_file, training_results, args.config_tag, is_main_process)
 
     if is_main_process:
         logger.info("="*70)
         logger.info("开始训练...")
+        os.makedirs(args.output_dir, exist_ok=True)
+
+    if dist.is_initialized():
+        dist.barrier()
 
     for epoch in range(1, args.epochs + 1):
         if hasattr(dataloader, "sampler") and isinstance(dataloader.sampler, DistributedSampler):
@@ -663,63 +711,62 @@ def main():
 
             epoch_results = evaluate_downstream_tasks(
                 model, tokenizer, dataset_path,
-                args.device, max_length=max_length, batch_size=8
+                args.device, max_length=max_length, batch_size=8,
+                log_details=False
             )
 
-            if is_main_process and epoch_results:
-                logger.info(
-                    f"Epoch {epoch} 评估完成 | "
-                    f"Acc={epoch_results['classification']['test_acc_mean']:.2f}, "
-                    f"AUC={epoch_results['link_prediction']['test_auc']:.2f}"
-                )
-
-                epoch_summary = {
-                    'epoch': epoch,
-                    'classification': {
-                        'acc': f"{epoch_results['classification']['test_acc_mean']:.2f}±{epoch_results['classification']['test_acc_std']:.2f}",
-                        'micro_f1': f"{epoch_results['classification']['test_micro_f1_mean']:.2f}±{epoch_results['classification']['test_micro_f1_std']:.2f}",
-                        'macro_f1': f"{epoch_results['classification']['test_macro_f1_mean']:.2f}±{epoch_results['classification']['test_macro_f1_std']:.2f}"
-                    },
-                    'link_prediction': {
-                        'auc': f"{epoch_results['link_prediction']['test_auc']:.2f}±{epoch_results['link_prediction']['test_auc_std']:.2f}",
-                        'ap': f"{epoch_results['link_prediction']['test_ap']:.2f}±{epoch_results['link_prediction']['test_ap_std']:.2f}"
-                    },
-                    'clustering': {
-                        'nmi': f"{epoch_results['clustering']['NMI_mean']:.4f}±{epoch_results['clustering']['NMI_std']:.4f}",
-                        'ari': f"{epoch_results['clustering']['ARI_mean']:.4f}±{epoch_results['clustering']['ARI_std']:.4f}",
-                        'f1': f"{epoch_results['clustering']['F1_mean']:.4f}±{epoch_results['clustering']['F1_std']:.4f}",
-                        'acc': f"{epoch_results['clustering']['ACC_mean']:.4f}±{epoch_results['clustering']['ACC_std']:.4f}"
-                    }
-                }
-
-                training_results['eval_results'].append(epoch_summary)
-                logger.info(f"Epoch {epoch} 评估结果已写入文件")
-                _append_to_results_file(args.results_file, training_results, args.config_tag, is_main_process)
+            if epoch_results:
+                cur_acc = epoch_results['classification']['test_acc_mean']
+                improved = cur_acc > best_cls_acc
+                if improved:
+                    best_cls_acc = cur_acc
+                    best_epoch = epoch
+                    if is_main_process:
+                        logger.info(f"Epoch {epoch} 刷新最佳分类 Acc={cur_acc:.2f}，详细指标：")
+                        _log_eval_metrics_from_results(epoch_results)
+                        epoch_summary = {
+                            'epoch': epoch,
+                            'source': 'training',
+                            'classification': {
+                                'acc': f"{epoch_results['classification']['test_acc_mean']:.2f}±{epoch_results['classification']['test_acc_std']:.2f}",
+                                'micro_f1': f"{epoch_results['classification']['test_micro_f1_mean']:.2f}±{epoch_results['classification']['test_micro_f1_std']:.2f}",
+                                'macro_f1': f"{epoch_results['classification']['test_macro_f1_mean']:.2f}±{epoch_results['classification']['test_macro_f1_std']:.2f}"
+                            },
+                            'link_prediction': {
+                                'auc': f"{epoch_results['link_prediction']['test_auc']:.2f}±{epoch_results['link_prediction']['test_auc_std']:.2f}",
+                                'ap': f"{epoch_results['link_prediction']['test_ap']:.2f}±{epoch_results['link_prediction']['test_ap_std']:.2f}"
+                            },
+                            'clustering': {
+                                'nmi': f"{epoch_results['clustering']['NMI_mean']:.4f}±{epoch_results['clustering']['NMI_std']:.4f}",
+                                'ari': f"{epoch_results['clustering']['ARI_mean']:.4f}±{epoch_results['clustering']['ARI_std']:.4f}",
+                                'f1': f"{epoch_results['clustering']['F1_mean']:.4f}±{epoch_results['clustering']['F1_std']:.4f}",
+                                'acc': f"{epoch_results['clustering']['ACC_mean']:.4f}±{epoch_results['clustering']['ACC_std']:.4f}"
+                            }
+                        }
+                        training_results['best_eval'] = epoch_summary
+                        logger.info("指标与 checkpoint 已按最佳分类 Acc 更新")
+                        _append_to_results_file(args.results_file, training_results, args.config_tag, is_main_process)
+                    if dist.is_initialized():
+                        dist.barrier()
+                    model.save_checkpoint(args.output_dir, tag="best_acc")
+                elif is_main_process:
+                    logger.info(
+                        f"Epoch {epoch} 评估完成 | Acc={cur_acc:.2f}（当前最佳 Acc={best_cls_acc:.2f} @ {_best_eval_ref_for_log()}），不写入指标文件"
+                    )
 
             if dist.is_initialized():
                 dist.barrier()
-
-        if is_main_process:
-            os.makedirs(args.output_dir, exist_ok=True)
-
-        if dist.is_initialized():
-            dist.barrier()
-
-        model.save_checkpoint(args.output_dir, tag=f"epoch_{epoch}")
-
-        if dist.is_initialized():
-            dist.barrier()
-
-    if dist.is_initialized():
-        dist.barrier()
-
-    model.save_checkpoint(args.output_dir, tag="final")
 
     if dist.is_initialized():
         dist.barrier()
     
     if is_main_process:
         _append_to_results_file(args.results_file, training_results, args.config_tag, is_main_process)
+        be = training_results.get('best_eval') or {}
+        if be.get('source') == 'baseline':
+            logger.info(
+                "全程未出现高于 Baseline 的分类 Acc；best_eval 与结果文件中的最佳指标保留为训练前 Baseline。"
+            )
         logger.info("="*70)
         logger.info(f"训练完成！")
 
